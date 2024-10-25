@@ -1,126 +1,147 @@
 import smbus
-import RPi.GPIO as GPIO
-import serial
 import time
-import datetime
-from w1thermsensor import W1ThermSensor
-from picamera import PiCamera
+import RPi.GPIO as GPIO
+import subprocess
+import random
+from gps import gps, WATCH_ENABLE
+from datetime import datetime
 
-# Initialize the sensors
+# Initialize GPS (if you're using it)
+gpsd = gps(mode=WATCH_ENABLE)
 
-# MPU-6050 Setup
-MPU_ADDRESS_1 = 0x68  # I2C address of the first MPU-6050
-MPU_ADDRESS_2 = 0x69  # I2C address of the second MPU-6050
-bus = smbus.SMBus(1)
-bus.write_byte_data(MPU_ADDRESS_1, 0x6B, 0)  # Wake up MPU-6050 #1
-bus.write_byte_data(MPU_ADDRESS_2, 0x6B, 0)  # Wake up MPU-6050 #2
+# Set up GPIO pins for IR sensors
+LEFT_IR_SENSOR_PIN = 17
+RIGHT_IR_SENSOR_PIN = 27
 
-# HC-SR04 Setup (for 4 sensors)
-TRIG = [23, 24, 25, 26]  # GPIO pins for Trigger for 4 sensors
-ECHO = [27, 28, 29, 30]  # GPIO pins for Echo for 4 sensors
 GPIO.setmode(GPIO.BCM)
-for i in range(4):
-    GPIO.setup(TRIG[i], GPIO.OUT)
-    GPIO.setup(ECHO[i], GPIO.IN)
+GPIO.setup(LEFT_IR_SENSOR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+GPIO.setup(RIGHT_IR_SENSOR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 
-# Neo-6M GPS Setup
-gps_serial = serial.Serial('/dev/ttyAMA0', baudrate=9600, timeout=1)
+# MPU-6050 registers and addresses
+MPU6050_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+ACCEL_YOUT_H = 0x3D
+ACCEL_ZOUT_H = 0x3F
 
-# DS18B20 Setup (for 2 sensors)
-temperature_sensors = W1ThermSensor.get_available_sensors()
+# Initialize the I2C bus
+bus = smbus.SMBus(1)
 
-# Camera Setup (for 4 cameras)
-cameras = [PiCamera(camera_num=i) for i in range(4)]
+# MPU6050 setup: Wake up the MPU-6050 from sleep mode
+bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0)
 
-# Function to read MPU-6050 data for both sensors
-def read_mpu(mpu_address):
-    acc_x = bus.read_word_data(mpu_address, 0x3B)
-    acc_y = bus.read_word_data(mpu_address, 0x3D)
-    acc_z = bus.read_word_data(mpu_address, 0x3F)
-    gyro_x = bus.read_word_data(mpu_address, 0x43)
-    gyro_y = bus.read_word_data(mpu_address, 0x45)
-    gyro_z = bus.read_word_data(mpu_address, 0x47)
-    return acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z
+# Function to read raw data from the sensor
+def read_raw_data(addr):
+    high = bus.read_byte_data(MPU6050_ADDR, addr)
+    low = bus.read_byte_data(MPU6050_ADDR, addr + 1)
+    value = (high << 8) | low
+    if value > 32768:
+        value -= 65536
+    return value
 
-# Function to measure distance using HC-SR04 for all sensors
-def measure_distance(trig, echo):
-    GPIO.output(trig, True)
-    time.sleep(0.00001)
-    GPIO.output(trig, False)
-    while GPIO.input(echo) == 0:
-        pulse_start = time.time()
-    while GPIO.input(echo) == 1:
-        pulse_end = time.time()
-    pulse_duration = pulse_end - pulse_start
-    distance = pulse_duration * 17150
-    distance = round(distance, 2)
-    return distance
+# Function to calculate acceleration in g
+def get_acceleration():
+    accel_x = read_raw_data(ACCEL_XOUT_H) / 16384.0
+    accel_y = read_raw_data(ACCEL_YOUT_H) / 16384.0
+    accel_z = read_raw_data(ACCEL_ZOUT_H) / 16384.0
+    return accel_x, accel_y, accel_z
 
-# Function to get GPS coordinates
-def get_gps():
-    data = gps_serial.readline().decode('ascii', errors='replace')
-    if "$GPGGA" in data:
-        parts = data.split(',')
-        if parts[2] and parts[4]:
-            latitude = float(parts[2]) / 100
-            longitude = float(parts[4]) / 100
-            return latitude, longitude
-    return None, None
-
-# Function to get temperature from multiple sensors
-def get_temperatures():
-    temperatures = []
-    for sensor in temperature_sensors:
-        temperature = sensor.get_temperature()
-        temperatures.append(temperature)
-    return temperatures
-
-# Function to capture images from all cameras
-def capture_images():
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    for i, camera in enumerate(cameras):
-        image_path = f'/home/pi/fishplate_image_camera_{i}_{timestamp}.jpg'
-        camera.capture(image_path)
-        print(f"Captured image from camera {i}: {image_path}")
-
-# Main loop to gather data and check conditions
-def main():
-    while True:
-        # Read data from both MPU-6050 sensors
-        acc1 = read_mpu(MPU_ADDRESS_1)
-        acc2 = read_mpu(MPU_ADDRESS_2)
-        
-        # Measure distances from all HC-SR04 sensors
-        distances = []
-        for i in range(4):
-            distance = measure_distance(TRIG[i], ECHO[i])
-            distances.append(distance)
-
-        # Get temperatures from both DS18B20 sensors
-        temperatures = get_temperatures()
-
-        # Get GPS coordinates
-        latitude, longitude = get_gps()
-
-        # Example thresholds (these should be adjusted based on real data)
-        if any(abs(val) > 2000 for val in acc1) or any(abs(val) > 2000 for val in acc2):
-            print("Alert: High vibration detected")
-            capture_images()  # Capture images if vibration is high
-        if any(dist < 5 for dist in distances):  # Example threshold for deformation
-            print("Alert: Fishplate deformation detected")
-            capture_images()  # Capture images if deformation is detected
-        if any(temp > 40 for temp in temperatures):  # Example threshold for temperature
-            print("Alert: High temperature detected")
-            capture_images()  # Capture images if temperature is high
-
-        if latitude and longitude:
-            print(f"Location: {latitude}, {longitude}")
-        
-        time.sleep(2)  # Delay for 2 seconds
-
-if __name__ == "__main__":
+# Function to capture image using libcamera-still with a dynamic name based on the current time
+def capture_image_with_time():
+    """Capture an image using libcamera-still with the current timestamp in the file name."""
+    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    image_path = f"/home/capstone/detection_{current_time}.jpg"
     try:
-        main()
+        subprocess.run(["libcamera-still", "-o", image_path, "-t", "1"], check=True)
+        print(f"Image captured and saved to {image_path}")
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to capture image: {e}")
+
+# Set threshold for vibration detection
+THRESHOLD_G = 1.15
+
+# Function to get current date and time as a string
+def get_current_time():
+    """Returns the current date and time as a formatted string."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# Function to generate random GPS coordinates within a specified range
+def generate_random_gps():
+    """Generate random GPS coordinates."""
+    lat = random.uniform(-90.0, 90.0)  # Latitude range
+    lon = random.uniform(-180.0, 180.0)  # Longitude range
+    return lat, lon
+
+# Countdown function before taking the picture
+def countdown(seconds):
+    """Countdown before taking a picture."""
+    for i in range(seconds, 0, -1):
+        print(f"Taking picture in {i} seconds...")
+        time.sleep(1)
+
+def monitor_railway():
+    """Monitors the railway track with IR sensors and MPU, and captures images if anomalies are detected."""
+    try:
+        while True:
+            # IR sensor detection (reversed logic)
+            left_rail_detected = GPIO.input(LEFT_IR_SENSOR_PIN)
+            right_rail_detected = GPIO.input(RIGHT_IR_SENSOR_PIN)
+
+            if left_rail_detected == 0 and right_rail_detected == 0:
+                print("Railway Track detected on both sides")
+            elif left_rail_detected == 1 and right_rail_detected == 0:
+                current_time = get_current_time()
+                lat, lon = generate_random_gps()
+                print(f"No Railway Track on Left Side. Time of obstruction: {current_time}. Obstruction detected at coordinates: ({lat:.6f}, {lon:.6f})")
+                print("Taking picture in 10 seconds...")
+                countdown(10)
+                capture_image_with_time()  # Save image with timestamped filename
+                time.sleep(15)  # Cooldown for 15 seconds before restarting
+                continue
+            elif left_rail_detected == 0 and right_rail_detected == 1:
+                current_time = get_current_time()
+                lat, lon = generate_random_gps()
+                print(f"No Railway Track on Right Side. Time of obstruction: {current_time}. Obstruction detected at coordinates: ({lat:.6f}, {lon:.6f})")
+                print("Taking picture in 10 seconds...")
+                countdown(10)
+                capture_image_with_time()  # Save image with timestamped filename
+                time.sleep(15)  # Cooldown for 15 seconds before restarting
+                continue
+            elif left_rail_detected == 1 and right_rail_detected == 1:
+                current_time = get_current_time()
+                lat, lon = generate_random_gps()
+                print(f"No Railway Track detected on both sides. Time of obstruction: {current_time}. Obstruction detected at coordinates: ({lat:.6f}, {lon:.6f})")
+                print("Taking picture in 10 seconds...")
+                countdown(10)
+                capture_image_with_time()  # Save image with timestamped filename
+                time.sleep(15)  # Cooldown for 15 seconds before restarting
+                continue
+
+            # MPU-6050 detection
+            accel_x, accel_y, accel_z = get_acceleration()
+            accel_total = (accel_x**2 + accel_y**2 + accel_z**2) ** 0.5
+
+            if accel_total > THRESHOLD_G:
+                current_time = get_current_time()
+                lat, lon = generate_random_gps()
+                print(f"Halt! Threshold detected due to high vibration. Detected g-force: {accel_total:.2f}g. Time of detection: {current_time}. Coordinates: ({lat:.6f}, {lon:.6f})")
+                print("Taking picture in 10 seconds...")
+                countdown(10)
+                capture_image_with_time()  # Save image with timestamped filename
+                time.sleep(15)  # Cooldown for 15 seconds before restarting
+                continue
+            else:
+                print(f"Railway track detected and normal threshold running. Current g-force: {accel_total:.2f}g")
+
+            # Delay before next check
+            time.sleep(0.5)
+
     except KeyboardInterrupt:
+        print("Program terminated.")
+
+    finally:
+        # Clean up GPIO resources
         GPIO.cleanup()
-        print("Program stopped by user")
+
+# Start monitoring the railway
+monitor_railway()
